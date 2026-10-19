@@ -138,7 +138,7 @@ Found a bug or a mod that breaks? Open an issue and include the game, the mod na
 
 ## Support
 
-If this saved you time or disk space, you can support development on [Ko-fi](https://ko-fi.com/kayano-tatsuya). It's appreciated but never required.
+If this saved you time or disk space, you can support development on [Ko-fi](https://ko-fi.com/kayanotatsuya). It's appreciated but never required.
 
 ## License
 
