@@ -142,7 +142,7 @@ If this saved you time or disk space, you can support development on [Ko-fi](htt
 
 ## License
 
-GPLv-3.0. See [LICENSE](LICENSE).
+AGPLv-3.0. See [LICENSE](LICENSE).
 
 ## Third-party software
 
