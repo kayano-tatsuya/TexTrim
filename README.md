@@ -6,13 +6,15 @@
 
 Mod textures are often far larger than they need to be. Big textures eat VRAM, slow down loading, and bloat downloads. TexTrim scans a mod folder and shrinks every oversized texture to a size you choose, while keeping each file's original compression format so the mod still loads correctly.
 
-Built for ZZZ and similar gacha games, and it should work with any game whose mods use DDS textures (the XXMI family: Zenless Zone Zero, Genshin Impact, Honkai: Star Rail, Wuthering Waves, and others). Microsoft's `texconv` is bundled into the exe, so there is nothing else to install.
+Built for ZZZ and similar gacha games, and it should work with any game whose mods use DDS textures (the XXMI family: Zenless Zone Zero, Genshin Impact, Honkai: Star Rail, Wuthering Waves, and others). Optional **TGA** support extends it to games whose mods use `.tga` textures, such as some War Thunder mods. Microsoft's `texconv` is bundled into the exe, so there is nothing else to install.
 
 ## Features
 
 - **Drag and drop** a mod folder onto the window and it scans right away
 - **Depth search** finds textures in nested subfolders
 - **Compression retention:** keeps each file's original format (BC1 to BC7 and other common DDS formats) instead of re-encoding everything to one format
+- **Encoding speed:** choose **Fast**, **Balanced** (default), or **Best** for how BC7 textures are re-encoded. Fast is much quicker on large batches, at a small quality cost.
+- **TGA support (optional):** tick **Also scan .tga textures** to include `.tga` files. They are resized and saved back as TGA.
 - **Presets by texture size** from 512px to 4096px, plus a custom limit up to 16384px
 - **Size limit mode:** textures at or under your limit are left alone, and larger ones are halved until they fit
 - **Review before you shrink:** a sortable table with a live filter box, per-row checkboxes, and **Check all / Uncheck all** for the visible rows
@@ -58,16 +60,17 @@ Each release includes a SHA-256 checksum so you can verify your download.
 1. Open TexTrim and drag your mod folder into the window (or use the **Browse** button). It scans automatically.
 2. Pick a preset, or enter a custom size. If you change the size after a scan, press **Scan** again to refresh the list.
 3. Review the list. Use the filter box to narrow it down, and uncheck anything you want to leave alone. Right-click a row to skip a whole mod.
-4. Leave **Back up originals** ticked (recommended), then click **Shrink checked** and wait for it to finish.
+4. Optionally set **Encoding** to Fast if you have many large BC7 textures. Leave **Back up originals** ticked (recommended), then click **Shrink checked** and wait for it to finish.
 5. Not happy with the result? Click **Restore backups** to put the originals back.
 
-Backups are copied to a folder named `<your mod folder>_texture_backup`, next to the folder you scanned. TexTrim changes files in place, so the backup is your safety net.
+Backups (DDS and TGA) are copied to a folder named `<your mod folder>_texture_backup`, next to the folder you scanned. TexTrim changes files in place, so the backup is your safety net.
 
 **Tip:** always keep a copy of the original mod until you've checked the result in-game.
 
 ## Supported formats
 
-- DDS textures (current)
+- DDS textures
+- TGA textures (optional, off by default): saved back as uncompressed TGA
 - Compression formats preserved: BC1 to BC7, and other formats that `texconv` can read and write
 
 More formats may be added later. Open an issue if you need one.
@@ -75,11 +78,12 @@ More formats may be added later. Open an issue if you need one.
 ## Known limitations
 
 - **Windows only for now.** `texconv` is a Windows tool, so Linux needs a different setup. Native Linux support is planned.
-- Only DDS is supported for now
+- Only DDS and TGA are supported for now
+- **TGA support is new.** TexTrim always saves TGA files uncompressed, so an RLE-compressed TGA can get *bigger* on disk even though the texture itself uses less memory. Those files start unchecked in the list. Test on a copy first, especially in games that are picky about their texture files.
 - Shrinking textures lowers image quality, so very small presets may look soft on close-ups. Block-compressed textures are decompressed, resized, and compressed again, which adds a little loss on top of the downscaling.
 - Textures are halved until they fit, so the result can end up smaller than your limit. For example, a 3072px texture with a 2048px limit becomes 1536px.
 - The savings estimate assumes block-compressed formats, where file size scales with pixel count. Real results can differ slightly.
-- Re-encoding BC7 can be slow on large batches
+- Re-encoding BC7 can be slow on large batches, especially without a compatible GPU (texconv uses the GPU for BC7 when it can). Set **Encoding** to **Fast** to speed it up at a small quality cost.
 - Some mods expect specific texture sizes, especially normal maps and light maps. Test on one mod first, and use the skip box (for example `normal, light`) to leave those alone.
 
 ## Building from source
@@ -138,11 +142,11 @@ Found a bug or a mod that breaks? Open an issue and include the game, the mod na
 
 ## Support
 
-If this saved you time or disk space, you can support development on [Ko-fi](https://ko-fi.com/kayanotatsuya). It's appreciated but never required.
+If this saved you time or disk space, you can support development on [Ko-fi](https://ko-fi.com/yourname). It's appreciated but never required.
 
 ## License
 
-AGPLv-3.0. See [LICENSE](LICENSE).
+[MIT or your chosen license]. See [LICENSE](LICENSE).
 
 ## Third-party software
 
