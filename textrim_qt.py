@@ -13,19 +13,21 @@ import html
 import sys
 import tempfile
 import threading
+import time
 import traceback
 from pathlib import Path
 
 from PySide6.QtCore import (QAbstractTableModel, QModelIndex, QObject, QSettings,
-                            QSortFilterProxyModel, Qt, QUrl, Signal)
+                            QSortFilterProxyModel, Qt, QTimer, QUrl, Signal)
 from PySide6.QtGui import QColor, QDesktopServices, QPainter, QPalette, QPen, QPixmap
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QFileDialog,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog,
                                QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
                                QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar,
-                               QPushButton, QSpinBox, QStackedWidget, QTableView, QVBoxLayout,
+                               QPushButton, QSizePolicy, QSpinBox, QStackedWidget, QTableView,
+                               QVBoxLayout,
                                QWidget)
 
-from textrim_core import (APP_NAME, Tex, app_dir, data_dir, default_backup_root, ensure_texconv, human,
+from textrim_core import (APP_NAME, Cancelled, Tex, app_dir, data_dir, default_backup_root, ensure_texconv, human,
                      restore_backups, run_mode, scan, shrink_one, startup_log)
 
 C = dict(
@@ -104,6 +106,21 @@ def build_qss() -> str:
     icon_path = data_dir() / "check.png"
     pm.save(str(icon_path), "PNG")
     url = icon_path.as_posix()
+
+    pm2 = QPixmap(32, 32)
+    pm2.fill(Qt.GlobalColor.transparent)
+    p2 = QPainter(pm2)
+    p2.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen2 = QPen(QColor(C["muted"]), 3.5)
+    pen2.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen2.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    p2.setPen(pen2)
+    p2.drawLine(9, 13, 16, 20)
+    p2.drawLine(16, 20, 23, 13)
+    p2.end()
+    chevron_path = data_dir() / "chevron.png"
+    pm2.save(str(chevron_path), "PNG")
+    chevron = chevron_path.as_posix()
     return QSS + f"""
 QTableView::indicator, QCheckBox::indicator {{
     width: 16px; height: 16px; border: 1px solid #4b5266; border-radius: 4px; background: {C['card2']};
@@ -113,6 +130,18 @@ QTableView::indicator:checked, QCheckBox::indicator:checked {{
     background: {C['accent']}; border-color: {C['accent']}; image: url("{url}");
 }}
 QCheckBox {{ spacing: 8px; }}
+QComboBox {{
+    background: {C['card2']}; border: 1px solid {C['line']}; border-radius: 6px; padding: 7px 10px;
+    min-width: 200px;
+}}
+QComboBox:focus, QComboBox:on {{ border-color: {C['accent']}; }}
+QComboBox:disabled {{ color: {C['muted']}; }}
+QComboBox::drop-down {{ border: none; width: 28px; }}
+QComboBox::down-arrow {{ image: url("{chevron}"); width: 14px; height: 14px; }}
+QComboBox QAbstractItemView {{
+    background: {C['card2']}; border: 1px solid {C['line']}; selection-background-color: {C['accent_dim']};
+    selection-color: white; outline: 0; padding: 4px;
+}}
 """
 
 
@@ -172,6 +201,9 @@ class TexModel(QAbstractTableModel):
                 Qt.AlignmentFlag.AlignHCenter if c in (1, 2) else Qt.AlignmentFlag.AlignRight)
             return int((a | Qt.AlignmentFlag.AlignVCenter).value)
         if role == Qt.ItemDataRole.ToolTipRole:
+            if t.grows:
+                return (f"{t.path}\n\nWould grow on disk: the original is RLE-compressed and TexTrim saves "
+                        "TGA files uncompressed. Unchecked by default; the texture itself would still use less memory in-game.")
             return str(t.path)
         return None
 
@@ -194,18 +226,27 @@ class TexModel(QAbstractTableModel):
     def set_rows(self, rows):
         self.beginResetModel()
         self.rows = list(rows)
-        self.checked = {str(t.path) for t in self.rows}
+        self.checked = {str(t.path) for t in self.rows if not t.grows}  # don't pre-check files that would get bigger
         self.endResetModel()
         self.checksChanged.emit()
 
     def remove_keys(self, keys):
+        """Remove many rows at once, in contiguous runs (one Qt notification per run)."""
         keys = set(keys)
-        for r in range(len(self.rows) - 1, -1, -1):
-            if str(self.rows[r].path) in keys:
-                self.beginRemoveRows(QModelIndex(), r, r)
-                self.checked.discard(str(self.rows[r].path))
-                del self.rows[r]
-                self.endRemoveRows()
+        if not keys:
+            return
+        idx = [i for i, t in enumerate(self.rows) if str(t.path) in keys]
+        runs = []
+        for i in idx:
+            if runs and i == runs[-1][1] + 1:
+                runs[-1][1] = i
+            else:
+                runs.append([i, i])
+        for first, last in reversed(runs):
+            self.beginRemoveRows(QModelIndex(), first, last)
+            del self.rows[first:last + 1]
+            self.endRemoveRows()
+        self.checked -= keys
         self.checksChanged.emit()
 
     def set_checked(self, keys, on):
@@ -223,6 +264,7 @@ class Bus(QObject):
     """Lives in the GUI thread; worker threads emit these and Qt queues them safely."""
     scan_done = Signal(list, int)
     progress = Signal(int, int)
+    current = Signal(int, int, str)       # index, total, description of texture being processed
     result = Signal(str, bool, str)       # key, ok, log line
     log = Signal(str)
     finished = Signal(int, int, str)      # bytes saved, failures, backup folder
@@ -252,12 +294,28 @@ class MainWindow(QMainWindow):
         self.proxy.setFilterKeyColumn(0)
         self.proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
 
+        self._pending_remove = set()
+        self._cur_text = ""
+        self._cur_start = 0.0
+        self._flush_timer = QTimer(self)
+        self._flush_timer.setSingleShot(True)
+        self._flush_timer.setInterval(300)
+        self._flush_timer.timeout.connect(self._flush_removals)
+        self._stats_timer = QTimer(self)
+        self._stats_timer.setSingleShot(True)
+        self._stats_timer.setInterval(30)
+        self._stats_timer.timeout.connect(self._do_update_stats)
+        self._tick_timer = QTimer(self)
+        self._tick_timer.setInterval(1000)
+        self._tick_timer.timeout.connect(self._tick)
+
         self._build()
         self._load_settings()
 
         b = self.bus
         b.scan_done.connect(self._on_scan_done)
         b.progress.connect(self._on_progress)
+        b.current.connect(self._on_current)
         b.result.connect(self._on_result)
         b.log.connect(self._log)
         b.finished.connect(self._on_finished)
@@ -295,7 +353,7 @@ class MainWindow(QMainWindow):
         title = QLabel("TexTrim")
         title.setObjectName("title")
         v.addWidget(title)
-        v.addWidget(self._label("Find oversized .dds textures in your mods and downscale them. "
+        v.addWidget(self._label("Find oversized textures in your mods and downscale them. "
                                 "Drop a folder anywhere on this window.", muted=True))
         v.addSpacing(14)
 
@@ -340,9 +398,32 @@ class MainWindow(QMainWindow):
         self.exclude_edit.setPlaceholderText("comma-separated, e.g. normal, light")
         g.addWidget(self.exclude_edit, 2, 1, 1, 3)
 
+        g.addWidget(self._label("Encoding", muted=True), 3, 0)
+        self.quality_combo = QComboBox()
+        self.quality_combo.addItem("Fast (quicker, slightly lower quality)", "fast")
+        self.quality_combo.addItem("Balanced (default)", "balanced")
+        self.quality_combo.addItem("Best (slowest)", "best")
+        self.quality_combo.setCurrentIndex(1)
+        enc = QHBoxLayout()
+        enc.setSpacing(12)
+        enc.addWidget(self.quality_combo)
+        enc.addWidget(self._label("Speed vs. quality when re-encoding BC7 textures", muted=True))
+        enc.addStretch(1)
+        g.addLayout(enc, 3, 1, 1, 3)
+
+        checks = QVBoxLayout()
+        checks.setSpacing(8)
         self.backup_check = QCheckBox("Back up originals before changing them (recommended)")
         self.backup_check.setChecked(True)
-        g.addWidget(self.backup_check, 3, 1, 1, 3)
+        checks.addWidget(self.backup_check)
+        trow = QHBoxLayout()
+        trow.setSpacing(12)
+        self.tga_check = QCheckBox("Also scan .tga textures")
+        trow.addWidget(self.tga_check)
+        trow.addWidget(self._label("TGA files are saved back uncompressed", muted=True))
+        trow.addStretch(1)
+        checks.addLayout(trow)
+        g.addLayout(checks, 4, 1, 1, 3)
         v.addWidget(card)
         v.addSpacing(12)
 
@@ -435,6 +516,7 @@ class MainWindow(QMainWindow):
 
         srow = QHBoxLayout()
         self.status = self._label("Choose your mods folder and press Scan.", muted=True)
+        self.status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.btn_log = self._button("Show log", self._toggle_log, ghost=True)
         self.btn_log.setStyleSheet("padding: 2px 8px;")
         srow.addWidget(self.status, 1)
@@ -443,6 +525,7 @@ class MainWindow(QMainWindow):
 
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(2000)
         self.log_view.setMaximumHeight(140)
         self.log_view.hide()
         v.addWidget(self.log_view)
@@ -457,6 +540,9 @@ class MainWindow(QMainWindow):
         self.max_spin.setValue(int(s.value("max", 2048)))
         self.exclude_edit.setText(s.value("exclude", "", str))
         self.backup_check.setChecked(str(s.value("backup", "true")).lower() != "false")
+        self.tga_check.setChecked(str(s.value("tga", "false")).lower() == "true")
+        qi = self.quality_combo.findData(str(s.value("quality", "balanced")))
+        self.quality_combo.setCurrentIndex(qi if qi >= 0 else 1)
         geo = s.value("geometry")
         if geo:
             self.restoreGeometry(geo)
@@ -470,6 +556,8 @@ class MainWindow(QMainWindow):
         s.setValue("max", self.max_spin.value())
         s.setValue("exclude", self.exclude_edit.text())
         s.setValue("backup", "true" if self.backup_check.isChecked() else "false")
+        s.setValue("tga", "true" if self.tga_check.isChecked() else "false")
+        s.setValue("quality", self.quality_combo.currentData())
         s.setValue("geometry", self.saveGeometry())
 
     def closeEvent(self, e):
@@ -543,29 +631,35 @@ class MainWindow(QMainWindow):
         self.btn_all.setEnabled(not busy and has)
         self.btn_none.setEnabled(not busy and has)
         self.btn_cancel.setVisible(busy)
-        for w in (self.folder_edit, self.exclude_edit, self.max_spin, self.backup_check):
+        for w in (self.folder_edit, self.exclude_edit, self.max_spin, self.backup_check, self.quality_combo,
+                  self.tga_check):
             w.setEnabled(not busy)
         for b in self.preset_btns.values():
             b.setEnabled(not busy)
         self._set_primary(self.btn_scan, not has)
         self._set_primary(self.btn_shrink, has)
 
-    def _visible_tex(self):
+    def _visible_tex(self, ordered=True):
+        if not ordered and not self.filter_edit.text().strip():
+            return self.model.rows  # no filter: every row is visible, skip the slow proxy lookups
         out = []
         for r in range(self.proxy.rowCount()):
             src = self.proxy.mapToSource(self.proxy.index(r, 0)).row()
             out.append(self.model.rows[src])
         return out
 
-    def _targets(self):
-        return [t for t in self._visible_tex() if str(t.path) in self.model.checked]
+    def _targets(self, ordered=True):
+        return [t for t in self._visible_tex(ordered) if str(t.path) in self.model.checked]
 
     def _checked_count(self):
-        return len(self._targets())
+        return len(self._targets(ordered=False))
 
     def _update_stats(self):
+        self._stats_timer.start()  # coalesce bursts of changes into one refresh
+
+    def _do_update_stats(self):
         total = self.model.rowCount()
-        tg = self._targets()
+        tg = self._targets(ordered=False)
         self.stat_vals[0].setText(str(total))
         self.stat_vals[1].setText(str(len(tg)))
         saved = sum(t.size - t.est_new_size for t in tg)
@@ -622,6 +716,7 @@ class MainWindow(QMainWindow):
         if not root or self.busy:
             return
         mx, excludes = self.max_spin.value(), self._excludes()
+        include_tga = self.tga_check.isChecked()
         self._save_settings()
         self.model.set_rows([])
         self.cancel.clear()
@@ -631,7 +726,7 @@ class MainWindow(QMainWindow):
 
         def work():
             try:
-                res = scan(root, mx, excludes, should_stop=self.cancel.is_set)
+                res = scan(root, mx, excludes, should_stop=self.cancel.is_set, include_tga=include_tga)
                 self.bus.scan_done.emit(res, mx)
             except Exception as e:  # noqa: BLE001
                 self.bus.error.emit(str(e))
@@ -643,11 +738,15 @@ class MainWindow(QMainWindow):
         self.table.sortByColumn(3, Qt.SortOrder.DescendingOrder)
         self._set_busy(False)
         if results:
-            self.status.setText(f"{len(results)} texture(s) larger than {mx}px"
-                                f"{' (scan cancelled, partial)' if cancelled else ''}. "
-                                "Uncheck anything you want to keep, then shrink.")
+            grow = sum(1 for t in results if t.grows)
+            msg = (f"{len(results)} texture(s) over {mx}px"
+                   f"{' (partial, scan cancelled)' if cancelled else ''}. Uncheck any you want to keep.")
+            if grow:
+                msg = (f"{len(results)} texture(s) over {mx}px. {grow} RLE TGA(s) would grow on disk "
+                       "and start unchecked.")
+            self.status.setText(msg)
         else:
-            self._set_empty("none", f"No .dds texture is larger than {mx}px.")
+            self._set_empty("none", f"No texture is larger than {mx}px.")
             self.status.setText("Scan cancelled." if cancelled else "Scan complete.")
 
     def _shrink(self):
@@ -666,7 +765,10 @@ class MainWindow(QMainWindow):
         self._set_busy(True)
         self.progress.setRange(0, len(targets))
         self.progress.setValue(0)
+        self._cur_text = ""
+        self._tick_timer.start()
         bus, cancel = self.bus, self.cancel
+        quality = self.quality_combo.currentData()
 
         def work():
             try:
@@ -675,14 +777,23 @@ class MainWindow(QMainWindow):
                 bus.error.emit(f"Could not get texconv.exe: {e}")
                 return
             saved = fails = 0
+            if quality != "balanced":
+                bus.log.emit(f"Encoding mode: {quality}")
             for i, t in enumerate(targets, 1):
                 if cancel.is_set():
                     bus.log.emit("Cancelled.")
                     break
+                rel = str(t.rel)
+                rel = rel if len(rel) <= 70 else "\u2026" + rel[-69:]
+                bus.current.emit(i, len(targets), f"{rel}  ({t.w}\u00d7{t.h}, {human(t.size)})")
                 try:
-                    b, a = shrink_one(t, texconv, backup, Path(tempfile.gettempdir()))
+                    b, a = shrink_one(t, texconv, backup, Path(tempfile.gettempdir()), cancel=cancel,
+                                  quality=quality, log=bus.log.emit)
                     saved += b - a
                     bus.result.emit(str(t.path), True, f"OK   {t.rel}: {human(b)} -> {human(a)}")
+                except Cancelled:
+                    bus.log.emit(f"Cancelled while processing {t.rel} (that file was left unchanged).")
+                    break
                 except Exception as e:  # noqa: BLE001
                     fails += 1
                     bus.result.emit(str(t.path), False, f"FAIL {t.rel}: {e}")
@@ -692,14 +803,32 @@ class MainWindow(QMainWindow):
 
     def _on_progress(self, i, n):
         self.progress.setValue(i)
-        self.status.setText(f"{i} / {n} done")
+
+    def _on_current(self, i, n, text):
+        self._cur_text = f"Shrinking {i} / {n}: {text}"
+        self._cur_start = time.time()
+        self.status.setText(self._cur_text)
+
+    def _tick(self):
+        if self.busy and self._cur_text:
+            self.status.setText(f"{self._cur_text}  \u00b7  {int(time.time() - self._cur_start)}s")
 
     def _on_result(self, key, ok, line):
         self._log(line)
         if ok:
-            self.model.remove_keys([key])
+            self._pending_remove.add(key)
+            if not self._flush_timer.isActive():
+                self._flush_timer.start()
+
+    def _flush_removals(self):
+        keys, self._pending_remove = self._pending_remove, set()
+        self.model.remove_keys(keys)
 
     def _on_finished(self, saved, fails, backup):
+        self._flush_timer.stop()
+        self._flush_removals()
+        self._tick_timer.stop()
+        self._cur_text = ""
         self._set_busy(False)
         msg = f"Done. Saved about {human(saved)}."
         if fails:
@@ -714,6 +843,7 @@ class MainWindow(QMainWindow):
         self._refresh_ui()
 
     def _on_error(self, text):
+        self._tick_timer.stop()
         self._set_busy(False)
         self.status.setText("Something went wrong.")
         self._set_empty("error", text[:200])
